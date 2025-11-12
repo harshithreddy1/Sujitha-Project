@@ -88,22 +88,39 @@ jobs:
           timeout: 10m
           script: |
             set -euxo pipefail
+
+            # --- Inject concrete values (expanded on runner) ---
+            ECR_REGISTRY="${{ env.ECR_REGISTRY }}"
+            ECR_REPOSITORY="${{ env.ECR_REPOSITORY }}"
+            AWS_REGION="${{ env.AWS_REGION }}"
+            CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
             TAG="${{ steps.validate.outputs.tag }}"
             IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}"
-            CONTAINER_NAME="${CONTAINER_NAME}"
-            AWS_REGION="${AWS_REGION}"
-            ECR_REGISTRY="${ECR_REGISTRY}"
+            # ---------------------------------------------------
 
             echo "Remote: starting deployment for ${IMAGE}"
 
-            if [ -f /etc/os-release ]; then . /etc/os-release; OS_ID="$ID"; else OS_ID="unknown"; fi
-            echo "Remote OS: ${OS_ID}"
+            # Detect OS
+            if [ -f /etc/os-release ]; then
+              . /etc/os-release
+              OS_ID="$ID"
+            else
+              OS_ID="unknown"
+            fi
+            echo "Remote: detected OS = ${OS_ID}"
 
+            # Install Docker if not present (Amazon Linux / Ubuntu / fallback)
             if ! command -v docker >/dev/null 2>&1; then
-              echo "Remote: installing Docker..."
-              if [ "${OS_ID}" = "amzn" ] || [ "${OS_ID}" = "amazon" ]; then
-                sudo amazon-linux-extras install docker -y || sudo yum install -y docker
-                sudo systemctl enable --now docker
+              echo "Remote: Docker not found — installing..."
+              if [ "${OS_ID}" = "amzn" ] || [ "${OS_ID}" = "amazon" ] || [ "${OS_ID}" = "centos" ] || [ "${OS_ID}" = "rhel" ]; then
+                if command -v yum >/dev/null 2>&1; then
+                  if command -v amazon-linux-extras >/dev/null 2>&1; then
+                    sudo amazon-linux-extras install docker -y
+                  else
+                    sudo yum install -y docker
+                  fi
+                  sudo systemctl enable --now docker
+                fi
               elif [ "${OS_ID}" = "ubuntu" ] || [ "${OS_ID}" = "debian" ]; then
                 sudo apt-get update -y
                 sudo apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
@@ -113,16 +130,20 @@ jobs:
                 sudo apt-get install -y docker-ce docker-ce-cli containerd.io
                 sudo systemctl enable --now docker
               else
+                echo "Remote: Unknown OS; trying get.docker.com"
                 curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
                 sudo sh /tmp/get-docker.sh
               fi
-              if id ec2-user >/dev/null 2>&1; then sudo usermod -aG docker ec2-user || true; fi
+              if id ec2-user >/dev/null 2>&1; then
+                sudo usermod -aG docker ec2-user || true
+              fi
             else
-              echo "Remote: docker present: $(docker --version)"
+              echo "Remote: docker already present: $(docker --version)"
             fi
 
+            # Install AWS CLI if missing
             if ! command -v aws >/dev/null 2>&1; then
-              echo "Remote: installing AWS CLI v2..."
+              echo "Remote: AWS CLI v2 not found — installing..."
               sudo apt-get update -y || true
               sudo apt-get install -y unzip || true
               curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
@@ -132,30 +153,35 @@ jobs:
               echo "Remote: aws present: $(aws --version)"
             fi
 
+            # Ensure AWS creds were exported into the remote environment (appleboy sets env)
             if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-              echo "Remote: AWS creds not present; aborting"
+              echo "Remote: AWS credentials not present; aborting"
               exit 1
             fi
 
-            echo "Remote: login to ECR and pull ${IMAGE}"
+            echo "Remote: login to ECR and pulling ${IMAGE}"
             aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
             docker pull "${IMAGE}"
 
+            # Replace container if exists
             if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+              echo "Remote: stopping & removing ${CONTAINER_NAME}"
               docker rm -f "${CONTAINER_NAME}" || true
             fi
 
             docker run -d --name "${CONTAINER_NAME}" --restart unless-stopped -p 3000:3000 "${IMAGE}"
+            echo "Remote: deployment finished"
             docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          # non-secret values are already injected into script above; keeping them for clarity
           AWS_REGION: ${{ env.AWS_REGION }}
           ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
           ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
 
-      - name: Health check
+      - name: Wait for app and perform health-check
         id: health
         run: |
           HOST="${{ env.EC2_HOST }}"
