@@ -24,15 +24,12 @@ env:
 jobs:
   build-push-deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
 
     steps:
       - name: Validate tag
         id: validate
         run: |
           TAG="${{ github.event.inputs.tag }}"
-          echo "Provided tag: $TAG"
           if ! echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "::error::Tag must be vMAJOR.MINOR.PATCH (e.g. v1.0.0)"
             exit 1
@@ -41,22 +38,20 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
-      - name: Configure AWS creds (runner)
+      - name: Configure AWS creds for runner
         uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Ensure ECR repo exists
+      - name: Ensure ECR repository exists
         run: |
           aws ecr describe-repositories --repository-names "${ECR_REPOSITORY}" >/dev/null 2>&1 || \
             aws ecr create-repository --repository-name "${ECR_REPOSITORY}" >/dev/null
-        env:
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        env: { ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }} }
 
       - name: Login Docker to ECR (runner)
         run: |
@@ -77,7 +72,7 @@ jobs:
           push: true
           tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.validate.outputs.tag }}
 
-      - name: Deploy to EC2 via SSH (appleboy)
+      - name: Deploy to EC2 via SSH (appleboy) — inject AWS creds into remote script
         id: deploy_ssh
         uses: appleboy/ssh-action@v0.1.7
         with:
@@ -89,81 +84,54 @@ jobs:
           script: |
             set -euxo pipefail
 
-            # --- Inject concrete values (expanded on runner) ---
+            # ---- Inject concrete non-secret values (expanded on runner) ----
             ECR_REGISTRY="${{ env.ECR_REGISTRY }}"
             ECR_REPOSITORY="${{ env.ECR_REPOSITORY }}"
             AWS_REGION="${{ env.AWS_REGION }}"
             CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
             TAG="${{ steps.validate.outputs.tag }}"
             IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}"
-            # ---------------------------------------------------
+            # ----------------------------------------------------------------
+
+            # ---- Inject AWS credentials HERE (expanded on runner) ----
+            AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+            AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            # Do NOT echo these values
+            export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION
+            # -----------------------------------------------------------
 
             echo "Remote: starting deployment for ${IMAGE}"
 
             # Detect OS
-            if [ -f /etc/os-release ]; then
-              . /etc/os-release
-              OS_ID="$ID"
-            else
-              OS_ID="unknown"
-            fi
+            if [ -f /etc/os-release ]; then . /etc/os-release; OS_ID="$ID"; else OS_ID="unknown"; fi
             echo "Remote: detected OS = ${OS_ID}"
 
-            # Install Docker if not present (Amazon Linux / Ubuntu / fallback)
+            # Docker already present on your AMI — but keep check to be safe
             if ! command -v docker >/dev/null 2>&1; then
-              echo "Remote: Docker not found — installing..."
-              if [ "${OS_ID}" = "amzn" ] || [ "${OS_ID}" = "amazon" ] || [ "${OS_ID}" = "centos" ] || [ "${OS_ID}" = "rhel" ]; then
-                if command -v yum >/dev/null 2>&1; then
-                  if command -v amazon-linux-extras >/dev/null 2>&1; then
-                    sudo amazon-linux-extras install docker -y
-                  else
-                    sudo yum install -y docker
-                  fi
-                  sudo systemctl enable --now docker
-                fi
-              elif [ "${OS_ID}" = "ubuntu" ] || [ "${OS_ID}" = "debian" ]; then
-                sudo apt-get update -y
-                sudo apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
-                curl -fsSL https://download.docker.com/linux/${OS_ID}/gpg | sudo apt-key add -
-                sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/${OS_ID} $(lsb_release -cs) stable"
-                sudo apt-get update -y
-                sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+              echo "Remote: installing Docker..."
+              if [ "${OS_ID}" = "amzn" ] || [ "${OS_ID}" = "amazon" ]; then
+                sudo amazon-linux-extras install docker -y || sudo yum install -y docker
                 sudo systemctl enable --now docker
               else
-                echo "Remote: Unknown OS; trying get.docker.com"
+                # fallback using get.docker.com
                 curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
                 sudo sh /tmp/get-docker.sh
               fi
-              if id ec2-user >/dev/null 2>&1; then
-                sudo usermod -aG docker ec2-user || true
-              fi
+              if id ec2-user >/dev/null 2>&1; then sudo usermod -aG docker ec2-user || true; fi
             else
-              echo "Remote: docker already present: $(docker --version)"
+              echo "Remote: docker present: $(docker --version)"
             fi
 
-            # Install AWS CLI if missing
-            if ! command -v aws >/dev/null 2>&1; then
-              echo "Remote: AWS CLI v2 not found — installing..."
-              sudo apt-get update -y || true
-              sudo apt-get install -y unzip || true
-              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
-              unzip -q /tmp/awscliv2.zip -d /tmp
-              sudo /tmp/aws/install || true
-            else
-              echo "Remote: aws present: $(aws --version)"
-            fi
-
-            # Ensure AWS creds were exported into the remote environment (appleboy sets env)
+            # AWS CLI already present on your instance; ensure env creds available
             if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-              echo "Remote: AWS credentials not present; aborting"
+              echo "Remote: AWS credentials not present (after injection); aborting"
               exit 1
             fi
 
-            echo "Remote: login to ECR and pulling ${IMAGE}"
+            echo "Remote: logging into ECR and pulling ${IMAGE}"
             aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
             docker pull "${IMAGE}"
 
-            # Replace container if exists
             if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
               echo "Remote: stopping & removing ${CONTAINER_NAME}"
               docker rm -f "${CONTAINER_NAME}" || true
@@ -173,9 +141,7 @@ jobs:
             echo "Remote: deployment finished"
             docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          # non-secret values are already injected into script above; keeping them for clarity
+          # These ensure the appleboy container has AWS envs available too, but credentials are injected above as well.
           AWS_REGION: ${{ env.AWS_REGION }}
           ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
           ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
