@@ -10,7 +10,7 @@ const app = express();
 const PORT = 3000;
 
 // ✅ MongoDB connection
-const MONGO_URI = process.env.MONGO_URI || "mongodb://mongo:27017/eventdb";
+const MONGO_URI = process.env.MONGO_URI || "mongodb://mongo-svc:27017/sujitha";
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log("✅ MongoDB connected"))
