@@ -22,16 +22,3 @@ spec:
             - name: MONGO_URI
               value: mongodb://mongo-svc:27017/sujitha
 
----
-
-apiVersion: v1
-kind: Service
-metadata:
-  name: sujitha-svc 
-spec:
-  type: LoadBalancer
-  selector:
-    app: harshith
-  ports:
-    - port: 3001
-      targetPort: 3000

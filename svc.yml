@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: combined-svc
+spec:
+  type: LoadBalancer
+  selector:
+    app: harshith
+  ports:
+    - name: sujitha-port
+      port: 3001
+      targetPort: 3000
+
+    - name: travel-port
+      port: 4001
+      targetPort: 4000
