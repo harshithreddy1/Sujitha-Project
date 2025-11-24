@@ -17,6 +17,9 @@ spec:
           image: harshithreddy628/sujitha:latest
           ports:
             - containerPort: 3000
+          env:
+            - name: MONGO_URI
+              value: mongodb://mongosvc:27017/eventdb
 
 ---
 
