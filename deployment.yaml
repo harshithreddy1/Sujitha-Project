@@ -19,7 +19,7 @@ spec:
             - containerPort: 3000
           env:
             - name: MONGO_URI
-              value: mongodb://mongosvc:27017/eventdb
+              value: mongodb://mongo-svc:27017/eventdb
 
 ---
 
